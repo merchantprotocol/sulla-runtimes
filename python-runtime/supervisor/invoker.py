@@ -1,34 +1,72 @@
-"""Routine invoker — dispatches to loaded handlers, handles sync/async uniformly.
+"""Routine invoker — runs handlers as subprocesses in their per-function venv.
 
-Secrets are NEVER passed in the /invoke request body. Instead, the caller
-provides a capability `secretsToken` + `secretsHostUrl`. Before running the
-handler, the invoker enumerates the env var NAMES declared in the function's
-`spec.integrations[].env` and fetches each value just-in-time from the host.
-After the handler completes (success or failure), the token is invalidated.
+Each invocation spawns a fresh Python subprocess using the function's dedicated
+virtualenv binary (or sys.executable for functions without requirements.txt).
+Inputs are piped to stdin as JSON; outputs are read from stdout.
 
-We deliberately use `urllib.request` from the stdlib here to avoid pulling in
-another HTTP client. The calls are small, synchronous, and happen inside an
-`asyncio.to_thread` so they do not block the event loop.
+Isolation guarantees:
+  - No sys.modules pollution: each subprocess starts with a clean import state.
+  - No package-version conflicts: each function's venv is fully isolated.
+  - Handler crash or OOM doesn't affect the supervisor process.
+  - Secrets are injected as env vars into the subprocess only, never into the
+    supervisor's own os.environ.
+
+Secrets:
+  Caller provides a capability secretsToken + secretsHostUrl. The invoker
+  fetches each declared env var just-in-time from the host, injects them into
+  the subprocess environment, and invalidates the token in finally. Secret
+  values never appear in logs or exception messages.
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from supervisor.loader import RoutineLoader
+from supervisor.loader import RoutineLoader, RoutineLoadError
 
 logger = logging.getLogger(__name__)
 
 SECRETS_FETCH_TIMEOUT_S = 5.0
+
+# Runner executed inside each invocation subprocess via `python -c`.
+# Env vars _SULLA_FN_FILE, _SULLA_FN_FUNC, _SULLA_FN_DIR are set by the invoker.
+# Using env vars avoids any shell-quoting issues with paths that contain spaces.
+_FN_RUNNER = """\
+import json, sys, importlib.util, os, inspect
+
+_fn_file = os.environ['_SULLA_FN_FILE']
+_fn_func = os.environ['_SULLA_FN_FUNC']
+_fn_dir  = os.environ['_SULLA_FN_DIR']
+
+sys.path.insert(0, _fn_dir)
+
+_spec = importlib.util.spec_from_file_location(
+    '__sulla_fn__', _fn_file,
+    submodule_search_locations=[_fn_dir],
+)
+_mod = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
+
+_handler = getattr(_mod, _fn_func)
+_inputs = json.load(sys.stdin)
+
+if inspect.iscoroutinefunction(_handler):
+    import asyncio as _asyncio
+    _result = _asyncio.run(_handler(_inputs))
+else:
+    _result = _handler(_inputs)
+
+json.dump(_result, sys.stdout)
+"""
 
 
 class InvocationError(Exception):
@@ -36,11 +74,7 @@ class InvocationError(Exception):
 
 
 class SecretsFetchError(Exception):
-    """Raised when a declared env var cannot be fetched from the host.
-
-    The message includes the env var NAME only — never the token, never the
-    integration slug, never the fetched value.
-    """
+    """Raised when a declared env var cannot be fetched from the host."""
 
 
 @dataclass
@@ -50,11 +84,6 @@ class InvocationResult:
 
 
 def _redact(text: str, secrets: list[str]) -> str:
-    """Replace any occurrence of a secret VALUE in `text` with '***'.
-
-    Operates on raw strings and applies to every element of `secrets` that is
-    non-empty. Sorted longest-first so overlapping prefixes don't leak.
-    """
     if not text or not secrets:
         return text
     out = text
@@ -65,16 +94,10 @@ def _redact(text: str, secrets: list[str]) -> str:
 
 
 def _collect_env_var_names(manifest: dict[str, Any]) -> list[str]:
-    """Union the KEYS of every `spec.integrations[].env` object in the manifest.
-
-    Emits a one-line WARN if two integrations declare the same env var name
-    (last-wins). We deliberately do NOT log the integration slug(s) involved.
-    """
     spec = manifest.get("spec") or {}
     integrations = spec.get("integrations") or []
     if not isinstance(integrations, list):
         return []
-
     seen: set[str] = set()
     duplicates: set[str] = set()
     ordered: list[str] = []
@@ -92,17 +115,12 @@ def _collect_env_var_names(manifest: dict[str, Any]) -> list[str]:
             else:
                 seen.add(key)
                 ordered.append(key)
-
     if duplicates:
-        logger.warning(
-            "Duplicate env var names declared across integrations (last-wins): %s",
-            sorted(duplicates),
-        )
+        logger.warning("Duplicate env var names declared (last-wins): %s", sorted(duplicates))
     return ordered
 
 
 def _fetch_one_secret(host_url: str, token: str, key: str) -> str:
-    """Blocking POST to {host_url}/secrets/fetch. Intended for thread use."""
     body = json.dumps({"token": token, "key": key}).encode("utf-8")
     req = urllib.request.Request(
         url=host_url.rstrip("/") + "/secrets/fetch",
@@ -114,9 +132,6 @@ def _fetch_one_secret(host_url: str, token: str, key: str) -> str:
         with urllib.request.urlopen(req, timeout=SECRETS_FETCH_TIMEOUT_S) as resp:
             payload = json.loads(resp.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as err:
-        # 4xx/5xx. Do NOT include the response body in the raised message —
-        # the host echoes {"error": "..."} but we must not surface anything
-        # that could imply the key's value or the token.
         raise SecretsFetchError(
             f"fetch denied for env var {key!r} (status {err.code})"
         ) from None
@@ -128,21 +143,15 @@ def _fetch_one_secret(host_url: str, token: str, key: str) -> str:
         raise SecretsFetchError(
             f"fetch returned malformed JSON for env var {key!r}"
         ) from None
-
     if not isinstance(payload, dict) or "value" not in payload:
-        raise SecretsFetchError(
-            f"fetch returned no value for env var {key!r}"
-        )
+        raise SecretsFetchError(f"fetch returned no value for env var {key!r}")
     value = payload["value"]
     if not isinstance(value, str):
-        raise SecretsFetchError(
-            f"fetch returned non-string value for env var {key!r}"
-        )
+        raise SecretsFetchError(f"fetch returned non-string value for env var {key!r}")
     return value
 
 
 def _invalidate_token(host_url: str, token: str) -> None:
-    """Best-effort token invalidation. Never raises. Never logs the token."""
     body = json.dumps({"token": token}).encode("utf-8")
     req = urllib.request.Request(
         url=host_url.rstrip("/") + "/secrets/invalidate",
@@ -154,10 +163,7 @@ def _invalidate_token(host_url: str, token: str) -> None:
         with urllib.request.urlopen(req, timeout=SECRETS_FETCH_TIMEOUT_S) as resp:
             resp.read()
     except Exception as err:
-        # Don't raise. Log type only.
-        logger.warning(
-            "secrets/invalidate best-effort failed: %s", type(err).__name__,
-        )
+        logger.warning("secrets/invalidate best-effort failed: %s", type(err).__name__)
 
 
 class RoutineInvoker:
@@ -171,89 +177,97 @@ class RoutineInvoker:
         inputs:           dict[str, Any],
         secrets_token:    str | None = None,
         secrets_host_url: str | None = None,
+        direct_env:       dict[str, str] | None = None,
     ) -> InvocationResult:
         loaded = self.loader.get(name, version)
         if loaded is None:
-            # Lazy-load on first invocation.
             loaded = self.loader.load(name, version)
 
-        handler = loaded.handler
-        start = time.monotonic()
-
         env_var_names = _collect_env_var_names(loaded.manifest)
-
-        # Branch 1: no secrets requested OR function declares no integrations.
-        # Skip all secret handling and run the handler directly.
         needs_secrets = bool(secrets_token) and bool(env_var_names)
 
         fetched_env: dict[str, str] = {}
         secret_values: list[str] = []
-        original_env_snapshot: dict[str, str] = {}
+        start = time.monotonic()
 
         try:
             if needs_secrets:
                 if not secrets_host_url:
-                    raise InvocationError(
-                        "secretsToken provided without secretsHostUrl"
-                    )
-                # Fetch every declared env var up-front. If any one fails,
-                # abort the whole invocation (no partial execution).
+                    raise InvocationError("secretsToken provided without secretsHostUrl")
                 for key in env_var_names:
                     try:
                         value = await asyncio.to_thread(
                             _fetch_one_secret, secrets_host_url, secrets_token, key,
                         )
                     except SecretsFetchError as err:
-                        # Message contains only the env var NAME, never the value.
                         raise InvocationError(str(err)) from None
                     fetched_env[key] = value
-
                 secret_values = [v for v in fetched_env.values() if v]
-                original_env_snapshot = os.environ.copy()
 
-                # Overlay onto os.environ for the duration of this handler call.
-                # This leaks to any concurrently-running handler in the same
-                # process; the supervisor accepts that tradeoff for the Python
-                # runtime (see TODO: sub-interpreter).
-                for k, v in fetched_env.items():
-                    os.environ[k] = v
+            # Build the subprocess env: base OS env + fetched secrets + direct env + fn locators.
+            # Secrets go directly to the subprocess — the supervisor's os.environ
+            # is never modified, so concurrent invocations can't race on env vars.
+            python_bin = (
+                str(loaded.venv_path / "bin" / "python")
+                if loaded.venv_path
+                else sys.executable
+            )
+            proc_env = {
+                **os.environ,
+                **fetched_env,
+                **(direct_env or {}),
+                "_SULLA_FN_FILE": str(loaded.module_file),
+                "_SULLA_FN_FUNC": loaded.func_name,
+                "_SULLA_FN_DIR":  str(loaded.path),
+            }
+
+            proc = await asyncio.create_subprocess_exec(
+                python_bin, "-c", _FN_RUNNER,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+            )
+            try:
+                stdout_data, stderr_data = await asyncio.wait_for(
+                    proc.communicate(json.dumps(inputs).encode("utf-8")),
+                    timeout=loaded.timeout_s,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise InvocationError(
+                    f"Handler timed out after {loaded.timeout_s}s"
+                ) from None
+
+            if proc.returncode != 0:
+                stderr_text = _redact(
+                    stderr_data.decode("utf-8", errors="replace").strip(),
+                    secret_values,
+                )
+                logger.error(
+                    "Handler subprocess exited %d for %s@%s",
+                    proc.returncode, name, version,
+                )
+                raise InvocationError(
+                    f"Function subprocess exited {proc.returncode}: {stderr_text}"
+                )
 
             try:
-                if inspect.iscoroutinefunction(handler):
-                    result = await handler(inputs)
-                else:
-                    # Run sync handlers in a worker thread so they can't block
-                    # the event loop handling concurrent invocations.
-                    result = await asyncio.to_thread(handler, inputs)
-            except Exception as err:
-                # Redact secret VALUES from the exception message before
-                # surfacing it. Do NOT log the env dict at any level.
-                safe_type = type(err).__name__
-                safe_msg = _redact(str(err), secret_values)
-                # Use a non-exception log line so traceback strings (which may
-                # contain secrets via repr of locals) are not emitted.
-                logger.error(
-                    "Handler raised for %s@%s: %s", name, version, safe_type,
+                result = json.loads(stdout_data.decode("utf-8"))
+            except json.JSONDecodeError as err:
+                raise InvocationError(
+                    f"Function output was not valid JSON: {err}"
+                ) from None
+
+            if not isinstance(result, dict):
+                raise InvocationError(
+                    f"Handler returned {type(result).__name__}, expected dict"
                 )
-                raise InvocationError(f"{safe_type}: {safe_msg}") from None
+
         finally:
-            # Restore os.environ exactly — remove added keys, restore any
-            # overwritten originals.
-            if fetched_env and original_env_snapshot is not None:
-                for k in list(fetched_env.keys()):
-                    if k in original_env_snapshot:
-                        os.environ[k] = original_env_snapshot[k]
-                    else:
-                        os.environ.pop(k, None)
-            # Zero local references to secret material BEFORE attempting the
-            # invalidate RPC — in case that RPC raises, we still clear state.
             fetched_env.clear()
             secret_values = []
-            original_env_snapshot = {}
-
-            # Best-effort invalidate the capability token — run off-loop, never
-            # raise. Guarded by `needs_secrets` because hosts that weren't
-            # asked for secrets shouldn't be pinged.
             if needs_secrets and secrets_token and secrets_host_url:
                 try:
                     await asyncio.to_thread(
@@ -266,10 +280,4 @@ class RoutineInvoker:
                     )
 
         duration_ms = int((time.monotonic() - start) * 1000)
-
-        if not isinstance(result, dict):
-            raise InvocationError(
-                f"Handler returned {type(result).__name__}, expected dict"
-            )
-
         return InvocationResult(outputs=result, duration_ms=duration_ms)

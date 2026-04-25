@@ -1,19 +1,23 @@
 // Node routine/function loader.
 //
-// Reads routine.yaml / function.yaml, dynamically imports the entrypoint,
-// and caches the resolved handler. Cache-busts on reload via a timestamp
-// query param on the import URL (Node's ESM loader keys by URL).
+// Reads function.yaml, installs npm dependencies if package.json is present,
+// then dynamically imports the entrypoint and caches the resolved handler.
+// Cache-busts on reload via a timestamp query param on the import URL.
 //
-// MVP limitations mirrored from python-runtime:
-//   - no per-routine npm install (pre-install deps in base image or commit
-//     node_modules for now; content-hash caching is follow-up work)
-//   - no permission enforcement
-//   - no filesystem watcher (reload is explicit via /load)
+// Dependency install uses npm into the function's own directory so Node's
+// native ESM resolution picks up the packages without any NODE_PATH tricks.
+// A marker file (node_modules/.sulla-installed) stores the package.json hash
+// to skip reinstall when the function is reloaded with unchanged deps.
 
+import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import url from 'node:url';
+import { promisify } from 'node:util';
 import yaml from 'js-yaml';
+
+const execFileAsync = promisify(execFile);
 
 export class NodeLoadError extends Error {
   constructor(msg) {
@@ -29,6 +33,52 @@ export class NodeLoader {
   }
 
   _key(name, version) { return `${name}@${version}`; }
+
+  async _installDeps(unitDir) {
+    const pkgJsonPath = path.join(unitDir, 'package.json');
+    try {
+      await fs.access(pkgJsonPath);
+    } catch {
+      return; // No package.json — nothing to install.
+    }
+
+    let pkgContent;
+    try {
+      pkgContent = await fs.readFile(pkgJsonPath, 'utf-8');
+    } catch (err) {
+      throw new NodeLoadError(`Failed to read package.json: ${err.message}`);
+    }
+
+    const hash = crypto.createHash('sha256').update(pkgContent).digest('hex').slice(0, 16);
+    const markerPath = path.join(unitDir, 'node_modules', '.sulla-installed');
+
+    let existingHash = '';
+    try {
+      existingHash = (await fs.readFile(markerPath, 'utf-8')).trim();
+    } catch {
+      // Marker missing → needs install.
+    }
+
+    if (existingHash === hash) {
+      return; // Already installed with this exact package.json.
+    }
+
+    try {
+      await execFileAsync(
+        'npm',
+        ['install', '--prefer-offline', '--no-audit', '--no-fund', '--no-save'],
+        { cwd: unitDir, timeout: 120_000 },
+      );
+    } catch (err) {
+      throw new NodeLoadError(
+        `npm install failed in ${unitDir}: ${err.stderr ?? err.message}`,
+      );
+    }
+
+    // Write marker so subsequent loads skip reinstall.
+    await fs.mkdir(path.join(unitDir, 'node_modules'), { recursive: true });
+    await fs.writeFile(markerPath, hash, 'utf-8');
+  }
 
   async load(name, version, unitPath) {
     const unitDir = unitPath ?? path.join(this.routinesDir, name);
@@ -83,8 +133,10 @@ export class NodeLoader {
       throw new NodeLoadError(`Entrypoint file not found: ${fullFile}`);
     }
 
+    // Install deps before importing so the ESM resolution finds node_modules.
+    await this._installDeps(unitDir);
+
     // Cache-bust the ESM loader by appending a unique query param.
-    // Without this, a second load() would return the previously cached module.
     const importUrl = `${url.pathToFileURL(fullFile).href}?v=${Date.now()}`;
 
     let mod;
@@ -124,8 +176,6 @@ export class NodeLoader {
     const key = this._key(name, version);
     if (!this.loaded.has(key)) return false;
     this.loaded.delete(key);
-    // Note: Node's ESM cache holds the old module until the process exits.
-    // That's fine — we bump the ?v= query on next load to get a fresh copy.
     return true;
   }
 

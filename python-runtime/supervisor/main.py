@@ -1,27 +1,27 @@
 """python-runtime supervisor — FastAPI app listening on an HTTP port.
 
-Loads Sulla **functions** (single units of code) and dispatches invocations
-from the workflow engine. Routines are orchestrated by the workflow engine
-itself — this runtime only runs functions.
-
-Listens on SULLA_HTTP_HOST:SULLA_HTTP_PORT (defaults 0.0.0.0:8080). The
-sulla-docker-compose.yaml binds the port to 127.0.0.1 on the host.
-Functions live at $SULLA_FUNCTIONS_DIR (default /var/functions), bind-mounted
-from the user's ~/sulla/functions/ at container-start time.
+Loads Sulla functions (single units of code) and dispatches invocations.
+Routines (workflow DAGs) are orchestrated by the workflow engine — this
+runtime only runs functions.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException
 
 from supervisor.invoker import InvocationError, RoutineInvoker
 from supervisor.loader import RoutineLoader, RoutineLoadError
 from supervisor.schemas import (
     HealthResponse,
+    InstallRequest,
+    InstallResponse,
     InvokeRequest,
     InvokeResponse,
     ListRoutinesResponse,
@@ -62,6 +62,60 @@ async def routines() -> ListRoutinesResponse:
     return ListRoutinesResponse(routines=loader.list_loaded())
 
 
+@app.post("/install", response_model=InstallResponse)
+async def install(req: InstallRequest) -> InstallResponse:
+    """Pre-install a function's dependencies without loading it.
+
+    Idempotent: subsequent calls with the same requirements.txt are a no-op
+    (cache hit). Returns whether the venv was already cached.
+    """
+    routine_path = Path(req.path) if req.path else Path(FUNCTIONS_DIR) / req.name
+    manifest_path = routine_path / "function.yaml"
+
+    if not manifest_path.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail=f"function.yaml not found in {routine_path}",
+        )
+    try:
+        with manifest_path.open() as f:
+            manifest = yaml.safe_load(f) or {}
+    except yaml.YAMLError as err:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {err}") from err
+
+    spec = manifest.get("spec") or {}
+    entrypoint = spec.get("entrypoint", "")
+    if "::" not in entrypoint:
+        raise HTTPException(status_code=400, detail="spec.entrypoint missing or invalid")
+
+    file_rel = entrypoint.split("::")[0]
+    module_file = routine_path / file_rel
+
+    reqs = module_file.parent / "requirements.txt"
+    if not reqs.is_file():
+        return InstallResponse(
+            installed=False,
+            cached=False,
+            message="No requirements.txt — nothing to install.",
+        )
+
+    digest = hashlib.sha256(reqs.read_bytes()).hexdigest()[:16]
+    already_cached = (loader.VENV_CACHE_DIR / digest / ".installed").exists()
+
+    try:
+        venv_path = loader.resolve_venv(module_file)
+    except RoutineLoadError as err:
+        raise HTTPException(status_code=500, detail=str(err)) from err
+
+    return InstallResponse(
+        installed=True,
+        cached=already_cached,
+        message=(
+            f"Venv {'(cached) ' if already_cached else ''}ready at {venv_path}"
+        ),
+    )
+
+
 @app.post("/load", response_model=LoadResponse)
 async def load(req: LoadRequest) -> LoadResponse:
     try:
@@ -78,7 +132,6 @@ async def load(req: LoadRequest) -> LoadResponse:
 
 @app.post("/invoke", response_model=InvokeResponse)
 async def invoke(req: InvokeRequest) -> InvokeResponse:
-    # NOTE: req.secretsToken is a capability token — NEVER log it.
     try:
         result = await invoker.invoke(
             req.name,
@@ -86,12 +139,11 @@ async def invoke(req: InvokeRequest) -> InvokeResponse:
             req.inputs,
             secrets_token=req.secretsToken,
             secrets_host_url=req.secretsHostUrl,
+            direct_env=req.env or None,
         )
     except RoutineLoadError as err:
-        # Lazy-load failure during invoke — surface as a client error.
         raise HTTPException(status_code=400, detail=str(err)) from err
     except InvocationError as err:
-        # Message has already been redacted inside the invoker.
         raise HTTPException(status_code=500, detail=str(err)) from err
     return InvokeResponse(outputs=result.outputs, duration_ms=result.duration_ms)
 

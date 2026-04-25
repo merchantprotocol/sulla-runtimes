@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# Supervisor deps + uv for per-function dependency resolution.
+# Supervisor deps + uv for per-function venv creation.
 RUN pip install \
       fastapi==0.115.6 \
       uvicorn[standard]==0.32.1 \
@@ -25,16 +25,14 @@ COPY sdk/ ./sdk/
 ENV SULLA_HTTP_HOST=0.0.0.0 \
     SULLA_HTTP_PORT=8080 \
     SULLA_FUNCTIONS_DIR=/var/functions \
-    SULLA_DEPS_CACHE=/opt/sulla/cache/deps \
+    SULLA_VENV_CACHE=/opt/sulla/cache/venvs \
     SULLA_LOG_LEVEL=INFO \
     PYTHONPATH=/opt/sulla
 
-# Functions bind-mount from the host's ~/sulla/functions/ via the Lima VM.
-# Deps cache volume persists installed requirements across container restarts.
-RUN mkdir -p /var/functions /opt/sulla/cache/deps
+RUN mkdir -p /var/functions /opt/sulla/cache/venvs
 
 EXPOSE 8080
-VOLUME ["/var/functions", "/opt/sulla/cache/deps"]
+VOLUME ["/var/functions", "/opt/sulla/cache/venvs"]
 
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -fsS http://localhost:8080/health || exit 1

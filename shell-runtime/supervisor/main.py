@@ -1,6 +1,6 @@
 """shell-runtime supervisor — FastAPI app on an HTTP port.
 
-Same protocol as python-runtime. Loads shell **functions** and dispatches
+Same protocol as python-runtime. Loads shell functions and dispatches
 invocations to bash subprocesses. Routines (workflow DAGs) are orchestrated
 by the workflow engine, not here.
 """
@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 
 import uvicorn
+import yaml
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from supervisor.invoker import InvocationError, ShellInvoker
 from supervisor.loader import ShellLoader, ShellLoadError
@@ -43,6 +46,18 @@ invoker = ShellInvoker(loader=loader)
 app = FastAPI(title="sulla.shell-runtime", version="0.1.0")
 
 
+class InstallRequest(BaseModel):
+    name: str
+    version: str
+    path: str | None = None
+
+
+class InstallResponse(BaseModel):
+    installed: bool
+    cached: bool
+    message: str
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(
@@ -55,6 +70,37 @@ async def health() -> HealthResponse:
 @app.get("/routines", response_model=ListRoutinesResponse)
 async def routines() -> ListRoutinesResponse:
     return ListRoutinesResponse(routines=loader.list_loaded())
+
+
+@app.post("/install", response_model=InstallResponse)
+async def install(req: InstallRequest) -> InstallResponse:
+    """Pre-install packages.txt packages without loading the function."""
+    unit_path = Path(req.path) if req.path else Path(FUNCTIONS_DIR) / req.name
+
+    pkg_file = unit_path / "packages.txt"
+    if not pkg_file.is_file():
+        return InstallResponse(
+            installed=False,
+            cached=False,
+            message="No packages.txt — nothing to install.",
+        )
+
+    try:
+        installed = loader.install_packages(unit_path)
+    except ShellLoadError as err:
+        raise HTTPException(status_code=500, detail=str(err)) from err
+
+    if installed:
+        return InstallResponse(
+            installed=True,
+            cached=False,
+            message=f"Installed: {', '.join(installed)}",
+        )
+    return InstallResponse(
+        installed=False,
+        cached=True,
+        message="All packages already installed.",
+    )
 
 
 @app.post("/load", response_model=LoadResponse)
@@ -73,7 +119,6 @@ async def load(req: LoadRequest) -> LoadResponse:
 
 @app.post("/invoke", response_model=InvokeResponse)
 async def invoke(req: InvokeRequest) -> InvokeResponse:
-    # NOTE: req.secretsToken is a capability token — NEVER log it.
     try:
         result = await invoker.invoke(
             req.name,
@@ -85,7 +130,6 @@ async def invoke(req: InvokeRequest) -> InvokeResponse:
     except ShellLoadError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
     except InvocationError as err:
-        # Message has already been redacted inside the invoker.
         raise HTTPException(status_code=500, detail=str(err)) from err
     return InvokeResponse(outputs=result.outputs, duration_ms=result.duration_ms)
 

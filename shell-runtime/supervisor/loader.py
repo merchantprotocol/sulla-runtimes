@@ -1,13 +1,15 @@
-"""Shell routine/function loader — manifest parsing + path caching.
+"""Shell routine/function loader — manifest parsing, package install, path caching.
 
-Unlike python-runtime, there's no importlib step. Shell scripts are invoked
-as subprocesses on each /invoke call. "Loading" here just means: validate the
-manifest, confirm the entrypoint file exists, and cache the resolved path.
+"Loading" here means: validate the manifest, install any extra Alpine packages
+declared in packages.txt, confirm the entrypoint file exists, and cache the
+resolved path. Shell scripts are invoked as subprocesses on each /invoke call.
 """
 
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,7 +28,7 @@ class LoadedShell:
     name:       str
     version:    str
     path:       Path
-    entrypoint: str          # relative path, e.g. "main.sh" or "functions/main.sh"
+    entrypoint: str          # relative path, e.g. "main.sh"
     script:     Path         # absolute path to the .sh file
     kind:       str          # "Routine" | "Function"
     manifest:   dict[str, Any]
@@ -34,7 +36,7 @@ class LoadedShell:
 
 
 class ShellLoader:
-    DEFAULT_TIMEOUT_S = 300.0  # matches spec.timeout default in shell-command routine
+    DEFAULT_TIMEOUT_S = 300.0
 
     def __init__(self, routines_dir: str):
         self.routines_dir = Path(routines_dir)
@@ -44,6 +46,71 @@ class ShellLoader:
     def _key(name: str, version: str) -> str:
         return f"{name}@{version}"
 
+    def install_packages(self, unit_path: Path) -> list[str]:
+        """Install extra Alpine packages declared in packages.txt.
+
+        Reads one package name per line (strips blank lines and # comments).
+        Runs `apk add --no-cache` for any packages not already installed.
+        Returns the list of packages that were actually installed (empty if all
+        were already present or no packages.txt exists).
+        Raises ShellLoadError on install failure.
+        """
+        pkg_file = unit_path / "packages.txt"
+        if not pkg_file.is_file():
+            return []
+
+        lines = pkg_file.read_text().splitlines()
+        packages = [
+            line.strip()
+            for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        if not packages:
+            return []
+
+        if shutil.which("apk") is None:
+            logger.warning(
+                "apk not on PATH; skipping package install for %s. "
+                "Packages will not be available.", unit_path.name,
+            )
+            return []
+
+        # Check which packages are already installed to skip redundant apk calls.
+        already_installed: set[str] = set()
+        for pkg in packages:
+            result = subprocess.run(
+                ["apk", "info", "--installed", pkg],
+                capture_output=True, timeout=10,
+            )
+            if result.returncode == 0:
+                already_installed.add(pkg)
+
+        to_install = [p for p in packages if p not in already_installed]
+        if not to_install:
+            logger.debug("All packages already installed for %s", unit_path.name)
+            return []
+
+        logger.info("Installing alpine packages for %s: %s", unit_path.name, to_install)
+        try:
+            subprocess.run(
+                ["apk", "add", "--no-cache"] + to_install,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.CalledProcessError as err:
+            raise ShellLoadError(
+                f"apk add failed for {pkg_file}: "
+                f"exit {err.returncode}\n{err.stderr or err.stdout}"
+            ) from err
+        except subprocess.TimeoutExpired:
+            raise ShellLoadError(
+                f"apk add timed out for {pkg_file}"
+            ) from None
+
+        return to_install
+
     def load(self, name: str, version: str, path: str | None = None) -> LoadedShell:
         unit_path = Path(path) if path else self.routines_dir / name
         if not unit_path.is_dir():
@@ -51,9 +118,7 @@ class ShellLoader:
 
         manifest_path = unit_path / "function.yaml"
         if not manifest_path.is_file():
-            raise ShellLoadError(
-                f"function.yaml not found in {unit_path}"
-            )
+            raise ShellLoadError(f"function.yaml not found in {unit_path}")
 
         try:
             with manifest_path.open() as f:
@@ -85,6 +150,9 @@ class ShellLoader:
         script = unit_path / entrypoint
         if not script.is_file():
             raise ShellLoadError(f"Entrypoint file not found: {script}")
+
+        # Install declared Alpine packages before registering the function.
+        self.install_packages(unit_path)
 
         timeout_s = self._parse_timeout(spec.get("timeout"))
 

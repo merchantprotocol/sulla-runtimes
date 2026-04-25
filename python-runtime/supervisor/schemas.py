@@ -12,7 +12,7 @@ class LoadRequest(BaseModel):
         default=None,
         description=(
             "Absolute path to the routine directory inside the container. "
-            "When omitted, resolves to SULLA_ROUTINES_DIR/<name>/."
+            "When omitted, resolves to SULLA_FUNCTIONS_DIR/<name>/."
         ),
     )
 
@@ -24,17 +24,25 @@ class LoadResponse(BaseModel):
     entrypoint: str
 
 
+class InstallRequest(BaseModel):
+    name: str
+    version: str
+    path: str | None = None
+
+
+class InstallResponse(BaseModel):
+    installed: bool
+    cached: bool
+    message: str
+
+
 class InvokeRequest(BaseModel):
     name: str
     version: str
     inputs: dict[str, Any] = Field(default_factory=dict)
-    # Capability-token-scoped secret fetching. The runtime pulls each declared
-    # env var just-in-time from the host using `secretsToken` against
-    # `secretsHostUrl`. No plaintext ever crosses the invoke boundary.
-    # Both are optional — handlers that declare no integrations work without
-    # them.
-    secretsToken:   str | None = None
+    secretsToken:   str | None = Field(default=None, repr=False)
     secretsHostUrl: str | None = None
+    env:            dict[str, str] = Field(default_factory=dict, repr=False)
 
 
 class InvokeResponse(BaseModel):
