@@ -166,7 +166,7 @@ export class NodeInvoker {
    * of the same function with different env values will race. Real isolation
    * requires worker_threads or sub-interpreters per call — tracked.
    */
-  async invoke(name, version, inputs, secretsToken, secretsHostUrl) {
+  async invoke(name, version, inputs, secretsToken, secretsHostUrl, directEnv) {
     let record = this.loader.get(name, version);
     if (!record) {
       record = await this.loader.load(name, version);
@@ -210,6 +210,18 @@ export class NodeInvoker {
           }
           process.env[k] = v;
           setKeys.push(k);
+        }
+      }
+
+      // Direct env injection — caller resolved values, inject same as fetched secrets.
+      if (directEnv && typeof directEnv === 'object') {
+        for (const [k, v] of Object.entries(directEnv)) {
+          if (typeof k !== 'string' || typeof v !== 'string') continue;
+          if (Object.prototype.hasOwnProperty.call(process.env, k)) {
+            previousValues.set(k, process.env[k]);
+          }
+          process.env[k] = v;
+          if (!setKeys.includes(k)) setKeys.push(k);
         }
       }
 

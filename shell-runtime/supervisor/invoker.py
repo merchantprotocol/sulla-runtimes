@@ -165,6 +165,7 @@ class ShellInvoker:
         inputs:           dict[str, Any],
         secrets_token:    str | None = None,
         secrets_host_url: str | None = None,
+        direct_env:       dict[str, str] | None = None,
     ) -> InvocationResult:
         loaded = self.loader.get(name, version)
         if loaded is None:
@@ -196,9 +197,11 @@ class ShellInvoker:
                     fetched_env[key] = value
 
                 secret_values = [v for v in fetched_env.values() if v]
-                # Merge os.environ + fetched keys into a NEW dict and pass via
-                # env= — this never mutates the supervisor's own process env.
-                subproc_env = {**os.environ, **fetched_env}
+
+            # Build subprocess env: base OS env + fetched secrets + direct env.
+            # Always create a new dict so the supervisor's os.environ is never mutated.
+            if fetched_env or direct_env:
+                subproc_env = {**os.environ, **fetched_env, **(direct_env or {})}
 
             try:
                 try:

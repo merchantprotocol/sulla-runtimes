@@ -93,13 +93,13 @@ app.post('/load', async (req, reply) => {
 });
 
 app.post('/invoke', async (req, reply) => {
-  const { name, version, inputs, secretsToken, secretsHostUrl } = req.body ?? {};
+  const { name, version, inputs, secretsToken, secretsHostUrl, env } = req.body ?? {};
   if (!name || !version) {
     return reply.code(400).send({ detail: 'name and version are required' });
   }
   try {
     const result = await invoker.invoke(
-      name, version, inputs ?? {}, secretsToken, secretsHostUrl,
+      name, version, inputs ?? {}, secretsToken, secretsHostUrl, env ?? null,
     );
     return { outputs: result.outputs, duration_ms: result.durationMs };
   } catch (err) {

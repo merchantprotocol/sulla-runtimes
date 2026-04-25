@@ -126,6 +126,7 @@ async def invoke(req: InvokeRequest) -> InvokeResponse:
             req.inputs,
             secrets_token=req.secretsToken,
             secrets_host_url=req.secretsHostUrl,
+            direct_env=req.env or None,
         )
     except ShellLoadError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err

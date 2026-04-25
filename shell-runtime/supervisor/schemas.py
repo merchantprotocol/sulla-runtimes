@@ -35,6 +35,10 @@ class InvokeRequest(BaseModel):
     # Both optional — handlers that declare no integrations work without them.
     secretsToken:   str | None = None
     secretsHostUrl: str | None = None
+    # Direct env injection: caller resolves secrets and passes values here.
+    # Values are merged into the subprocess env — supervisor's own os.environ
+    # is never modified. Repr is suppressed so values are not logged.
+    env: dict[str, str] = Field(default_factory=dict, repr=False)
 
 
 class InvokeResponse(BaseModel):
